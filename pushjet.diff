@@ -1,0 +1,202 @@
+diff --git a/amon/apps/alerts/forms.py b/amon/apps/alerts/forms.py
+--- a/amon/apps/alerts/forms.py
++++ b/amon/apps/alerts/forms.py
+@@ -23,6 +23,7 @@ PROCESS_CHOICES = [
+ PROVIDER_CHOICES = [
+ 	('pagerduty', 'PagerDuty'),
+ 	('opsgenie', 'OpsGenie'),
++	('pushjet', 'Pushjet'), 
+ 	('pushover', 'Pushover'), 
+ 	('victorops', 'VictorOps'), 
+ ]
+@@ -86,4 +87,4 @@ class EditAlertForm(forms.Form):
+ 	metric_value = forms.IntegerField(min_value=0, initial=0)
+ 	above_below = forms.ChoiceField(choices=ABOVE_BELOW_CHOICES)
+ 	period = forms.ChoiceField(choices=PERIOD_CHOICES)
+-	notifications = forms.MultipleChoiceField(choices=PROVIDER_CHOICES, widget=forms.CheckboxSelectMultiple(), required=False)
+\ No newline at end of file
++	notifications = forms.MultipleChoiceField(choices=PROVIDER_CHOICES, widget=forms.CheckboxSelectMultiple(), required=False)
+diff --git a/amon/apps/notifications/forms.py b/amon/apps/notifications/forms.py
+--- a/amon/apps/notifications/forms.py
++++ b/amon/apps/notifications/forms.py
+@@ -1,6 +1,23 @@
+ from django import forms
+ 
+ 
++class PushjetForm(forms.Form):
++
++	def __init__(self, *args, **kwargs):
++		self.form_data = kwargs.pop('provider_data', None)
++
++		super(PushjetForm, self).__init__(*args, **kwargs)
++
++		try:
++			self.fields['secret'].initial = self.form_data.get('secret')
++		except:
++			pass
++
++	secret = forms.CharField(required=True, max_length=32, widget=forms.TextInput(attrs={'placeholder': 'Secret'}),
++		label='Secret')
++
++
++
+ class PushoverForm(forms.Form):
+ 
+ 	def __init__(self, *args, **kwargs):
+diff --git a/amon/apps/notifications/generator.py b/amon/apps/notifications/generator.py
+--- a/amon/apps/notifications/generator.py
++++ b/amon/apps/notifications/generator.py
+@@ -7,7 +7,8 @@ from django.template.loader import render_to_string
+ 
+ def generate_message(notification=None):
+ 	message = 'Test Notification'
+-	
++	if notification is None:
++		return message	
+ 
+ 	alert_type = notification.alert.get('rule_type')
+ 	if alert_type == 'process':
+@@ -77,4 +78,4 @@ def generate_notifications():
+ 
+ 			notifications_list.append(result)
+ 
+-	return notifications_list
+\ No newline at end of file
++	return notifications_list
+diff --git a/amon/apps/notifications/pushjet/__init__.py b/amon/apps/notifications/pushjet/__init__.py
+new file mode 100644
+diff --git a/amon/apps/notifications/pushjet/sender.py b/amon/apps/notifications/pushjet/sender.py
+new file mode 100644
+--- /dev/null
++++ b/amon/apps/notifications/pushjet/sender.py
+@@ -0,0 +1,24 @@
++import requests
++from amon.apps.notifications.models import notifications_model
++from amon.apps.notifications.generator import generate_message	
++
++
++def send_pushjet_notification(notification=None):
++	sent = False
++	url = "https://api.pushjet.io/message"
++	auth_data = notifications_model.get_for_provider(provider_id='pushjet')
++
++	message = generate_message(notification=notification)
++
++	data = {'secret': auth_data.get('secret'), 'message': message}
++
++	error = None
++	try:
++		r = requests.post(url, data=data, timeout=5)
++		js = r.json()
++		if 'error' in js:
++			raise Exception(js['message'])
++	except Exception, e:
++		error = e
++
++	return error
+diff --git a/amon/apps/notifications/sender.py b/amon/apps/notifications/sender.py
+--- a/amon/apps/notifications/sender.py
++++ b/amon/apps/notifications/sender.py
+@@ -2,6 +2,7 @@ from amon.apps.notifications.generator import generate_notifications
+ 
+ from amon.apps.notifications.mail.sender import send_notification_email
+ from amon.apps.notifications.webhooks.sender import send_webhook_notification
++from amon.apps.notifications.pushjet.sender import send_pushjet_notification
+ from amon.apps.notifications.pushover.sender import send_pushover_notification
+ from amon.apps.notifications.victorops.sender import send_victorops_notification
+ from amon.apps.notifications.pagerduty.sender import send_pagerduty_notification
+@@ -19,6 +20,8 @@ def send_notifications():
+ 			send_webhook_notification(notification=n)
+ 
+ 			for thirdparty_noti in n.thirdparty:
++				if thirdparty_noti == 'pushjet':
++					send_pushjet_notification(notification=n)
+ 				if thirdparty_noti == 'pushover':
+ 					send_pushover_notification(notification=n)
+ 				if thirdparty_noti == 'opsgenie':
+diff --git a/amon/apps/notifications/utils.py b/amon/apps/notifications/utils.py
+--- a/amon/apps/notifications/utils.py
++++ b/amon/apps/notifications/utils.py
+@@ -3,7 +3,7 @@ from amon.apps.notifications.models import notifications_model
+ 
+ def active_notification_providers_list():
+ 
+-	providers = ['pagerduty', 'opsgenie', 'pushover','victorops']
++	providers = ['pagerduty', 'opsgenie', 'pushover', 'victorops', 'pushjet']
+ 	active_list = []
+ 
+ 	for provider_id in providers:
+diff --git a/amon/apps/notifications/views.py b/amon/apps/notifications/views.py
+--- a/amon/apps/notifications/views.py
++++ b/amon/apps/notifications/views.py
+@@ -6,12 +6,14 @@ from django.contrib.auth.decorators import login_required
+ from django.contrib import messages
+ 
+ from amon.apps.notifications.forms import (
++	PushjetForm,
+ 	PushoverForm,
+ 	PagerDutyForm,
+ 	VictorOpsForm,
+ 	OpsGenieForm
+ )
+ from amon.apps.notifications.models import notifications_model
++from amon.apps.notifications.pushjet.sender import send_pushjet_notification
+ from amon.apps.notifications.pushover.sender import send_pushover_notification
+ from amon.apps.notifications.pagerduty.sender import send_pagerduty_notification
+ from amon.apps.notifications.victorops.sender import send_victorops_notification
+@@ -29,7 +31,9 @@ def view(request):
+ def edit(request, provider_id=None):
+ 	provider_data = notifications_model.get_for_provider(provider_id=provider_id)
+ 	
+-	if provider_id == 'pushover':
++	if provider_id == 'pushjet':
++		provider_form = PushjetForm
++	elif provider_id == 'pushover':
+ 		provider_form = PushoverForm
+ 	elif provider_id == 'pagerduty':
+ 		provider_form = PagerDutyForm
+@@ -65,7 +69,9 @@ def edit(request, provider_id=None):
+ def test(request, provider_id=None):
+ 	message  = 'Sending test notification to {0}'.format(provider_id.title())
+ 
+-	if provider_id == 'pushover':
++	if provider_id == 'pushjet':
++		send_pushjet_notification()
++	elif provider_id == 'pushover':
+ 		send_pushover_notification()
+ 	elif provider_id == 'pagerduty':
+ 		send_pagerduty_notification()
+@@ -78,4 +84,4 @@ def test(request, provider_id=None):
+ 
+ 	messages.add_message(request, messages.INFO, message)	
+ 	
+-	return redirect(reverse('notifications_edit', kwargs={'provider_id': provider_id}))
+\ No newline at end of file
++	return redirect(reverse('notifications_edit', kwargs={'provider_id': provider_id}))
+diff --git a/amon/static/images/integrations/pushjet.png b/amon/static/images/integrations/pushjet.png
+new file mode 100644
+Binary files /dev/null and b/amon/static/images/integrations/pushjet.png differ
+diff --git a/amon/templates/notifications/_left.html b/amon/templates/notifications/_left.htmlin
+--- a/amon/templates/notifications/_left.html
++++ b/amon/templates/notifications/_left.html
+@@ -1,5 +1,13 @@
+ <div class="left">
+ 	<ul> 
++		<li {% if provider_id == 'pushjet' %}class='active' {% endif %}>
++			<a  href="{% url 'notifications_edit' provider_id='pushjet' %}">
++			<img src="{{ STATIC_URL }}images/integrations/pushjet.png" alt="Pushjet">
++			<h4>Pushjet</h4>
++			<p>Open source psuh notifications for your Android device</p>
++			</a>
++		</li>
++
+ 		<li {% if provider_id == 'pushover' %}class='active' {% endif %}>
+ 			<a  href="{% url 'notifications_edit' provider_id='pushover' %}">
+ 			<img src="{{ STATIC_URL }}images/integrations/pushover.png" alt="Pushover">
+@@ -36,4 +44,4 @@
+ 		</li>
+ 		
+ 	</ul>
+-</div>
+\ No newline at end of file
++</div>
